@@ -81,6 +81,22 @@
   `bucket_diffs`），并附汇总计数。目标策略或任一请求命中的策略存在
   **待生效（pending）**定时变更时返回 **409**；目标策略不存在返回 **404**。
   预演**全程只读**：不改动策略、桶、裁决与事件数据，且无需认证。
+- **配额子集规划（POST /quota-plans，免认证、只读）**：一次提交 **1～18** 个
+  待执行请求，每项含唯一 `item_id`、`tenant_id`、可选 `route_id`（提供则必须
+  带 `tenant_id`）、**正数** `cost` 与**非负整数** `value`。服务在**同一只读
+  快照、同一时刻**上复用裁决的三级桶匹配（全局 → 租户 → 路由，未配置的层不
+  限制）：命中桶按**现行**策略补充到该时刻（**未建桶按现行容量满额**），
+  **不推进定时策略变更**（即便变更已到期也保持 `pending`，仅按 `policies` 表
+  当前行演算），**也不做预占到期返还或任何预占状态推进**（快照余额即数据库中
+  的现行余额，已含预占预扣）。每个入选条目在其**所有命中桶**各占用一份 `cost`
+  （未命中任何已配置层的条目不受桶限制），各桶入选条目合计占用不得超过快照余额。
+  服务在至多 2¹⁸ 个子集上**精确枚举**（含上界剪枝）求最优：先最大化总收益
+  `value`；总收益相同时取**条目数更多**者；再相同时取**升序 `item_id` 列表
+  字典序更小**者。响应返回入选/未入选 ID（均按升序）、`total_value`、任一入选
+  条目命中桶在占用后的剩余额（`remaining`）与快照时刻 `planned_at`；没有任何
+  可行项时入选为空集、桶列表为空。规划**全程只读**（不建桶、不写桶、不存档、
+  不产生事件），其结果只反映该快照时刻，**不保证这些请求之后真实准入**——实际
+  准入仍以 `POST /decide` 为准。
 - **配额预占（reservation）**：`POST /reservations` 接收 `reservation_id`、`tenant_id`、
   `route_id`、正数 `cost` 与 **1～300 秒**的 `ttl_seconds`，复用多级桶与 SQLite
   写事务完成「预扣 → 确认/取消/到期返还」：
@@ -113,8 +129,8 @@
   `PUT /policies`（策略新增/更新）、`POST /policies/rollback`（回滚）、
   `POST /policy-changes`（定时变更创建）、`DELETE /policy-changes/{change_id}`
   （定时变更取消）。**所有 GET、`POST /decide`、`POST /decide-batches` 裁决、
-`POST /policies/impact-preview` 预演、撤销与预占（`POST /reservations` 及其
-确认/取消/查询）接口保持原样、无需认证**。
+`POST /policies/impact-preview` 预演、`POST /quota-plans` 子集规划、撤销与预占
+（`POST /reservations` 及其确认/取消/查询）接口保持原样、无需认证**。
   客户端发送 `X-Key-Id`、`X-Timestamp`（Unix 秒）、`X-Nonce`、`X-Signature` 四个头，
   签名原文为 `方法\n原始路径及查询串\n请求体 SHA-256 十六进制\n时间戳\nnonce`，
   签名值为小写十六进制 HMAC-SHA256。服务端用 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`
@@ -166,8 +182,9 @@ SQLite 数据文件保存在命名卷 `quota-data`（容器内 `/data/quota.db`�
 `docker compose down` 不会删除；如需清空：`docker compose down -v`。
 
 > **依赖安装与建表均随启动完成**：镜像构建时安装 `requirements.txt` 中的依赖；
-> 服务启动（FastAPI lifespan）时自动执行建表/老库迁移（含本版本新增的
-> `reservations` 表），无需任何手动初始化步骤。
+> 服务启动（FastAPI lifespan）时自动执行建表/老库迁移（含 `reservations` 等全部
+> 表），无需任何手动初始化步骤。启动后匿名只读的 `POST /quota-plans` 子集规划
+> 接口立即可用（不新增表、不新增依赖、不需要额外配置）。
 
 ### 配置项（环境变量）
 
@@ -312,6 +329,7 @@ print(urllib.request.urlopen(req).read().decode())
 | `GET`  | `/policies/history` | 按 scope/tenant_id/route_id 查询单策略的不可变版本历史（新版本在前） |
 | `POST` 🔐 | `/policies/rollback` | 在同一写事务内把策略恢复到指定历史版本并追加 `rollback` 版本；有 pending 变更时 409，未知策略/版本 404 |
 | `POST` | `/policies/impact-preview` | 只读预演候选容量/速率对未来 0～3600 秒请求序列的影响（现行/候选双侧逐条对比，不落库）；目标策略不存在 404，命中 pending 变更 409 |
+| `POST` | `/quota-plans` | 只读快照上为 1～18 个待执行请求求配额内总收益最大的精确最优子集（同刻补充、未建桶满额；不推进定时变更/预占；总收益→项数→升序 ID 字典序） |
 | `POST` 🔐 | `/policy-changes` | 为已存在的策略提交一条未来生效的定时切换 |
 | `GET`  | `/policy-changes` | 列出定时变更（可按 `status` / 策略键过滤） |
 | `GET`  | `/policy-changes/{change_id}` | 查询单条定时变更 |
@@ -920,6 +938,57 @@ true`，候选侧余额 2.5 不扣减），第 3 条在两侧均获准：
 > - 预演**全程只读**：策略、桶、裁决（`decisions`）与低余额事件均不受影响，
 >   也不产生任何事件；接口免认证。
 
+## 配额子集规划（POST /quota-plans，免认证、只读）
+
+给定 **1～18** 个待执行请求，在**当前这一只读快照**上选出「配额内总收益最大」
+的精确最优子集。它复用裁决的三级桶匹配：所有命中桶在**同一时刻**按**现行**
+策略补充（未建桶按现行容量**满额**）；**不应用**定时策略变更（已到期的也保持
+`pending`），**不推进**预占到期或预占状态。每个入选条目在其所有命中桶各占用
+一份 `cost`，各桶合计占用不得超过快照余额；未命中任何已配置层的条目不受限制。
+
+```bash
+curl -s -X POST http://localhost:8000/quota-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "items": [
+      {"item_id":"job-a","tenant_id":"acme","route_id":"/v1/search","cost":3,"value":10},
+      {"item_id":"job-b","tenant_id":"acme","cost":2,"value":7},
+      {"item_id":"job-c","cost":4,"value":4}
+    ]
+  }'
+```
+
+```json
+{
+  "selected_item_ids": ["job-a", "job-b"],
+  "rejected_item_ids": ["job-c"],
+  "total_value": 17,
+  "buckets": [
+    {"scope": "global", "tenant_id": null, "route_id": null,
+     "capacity": 10.0, "refill_rate": 0.0, "remaining": 5.0},
+    {"scope": "tenant", "tenant_id": "acme", "route_id": null,
+     "capacity": 6.0, "refill_rate": 0.0, "remaining": 1.0},
+    {"scope": "route", "tenant_id": "acme", "route_id": "/v1/search",
+     "capacity": 4.0, "refill_rate": 0.0, "remaining": 1.0}
+  ],
+  "planned_at": "2026-09-27T12:00:00.000000Z"
+}
+```
+
+> - 择优规则（精确最优，枚举至多 2¹⁸ 个子集并带上界剪枝）：
+>   ① `sum(value)` 最大；② 总收益相同时**条目数更多**者；
+>   ③ 再相同时**升序 `item_id` 列表字典序更小**者。
+>   `selected_item_ids` / `rejected_item_ids` 始终按 ID 升序返回。
+> - `buckets` 只包含**任一入选条目命中**的桶（全局 → 租户 → 路由键升序），
+>   `remaining` = 快照补充后余额 − 入选子集在该桶的合计占用；没有入选项命中
+>   任何桶时为空列表。没有可行项时入选为空集、`total_value=0`。
+> - 校验：`items` 数量必须为 **1～18**；`item_id` 非空且在请求内唯一；
+>   `cost` 必须为正数；`value` 必须为**非负整数**；`route_id` 必须与
+>   `tenant_id` 一起提供——任一不满足返回 **422**。
+> - **全程只读**：不创建/更新桶、不写裁决或事件、不改变定时变更与预占状态；
+>   规划基于快照时刻「策略与余额不变、无其他流量」的假设演算，**不保证**入选
+>   请求之后真实准入——请仍以 `POST /decide` 的裁决结果为准。
+
 ## 配额预占（reservation，免认证）
 
 预占用于「先占额度、稍后确认」的两阶段消费：创建时在**同一 `BEGIN IMMEDIATE`
@@ -1050,6 +1119,16 @@ curl -s http://localhost:8000/reservations/rsv-001
   - 未命中任何已配置策略层的请求两侧均为准入、`buckets` 为空；
   - 预演是基于「窗口内策略不变、无其他流量」假设的演算，实际裁决仍以
     `POST /decide` 为准。
+- 配额子集规划（`POST /quota-plans`）的额外约定：
+  - 只读快照事务：命中桶按现行策略在同一时刻补充，未建桶按现行容量满额；
+    **不应用**定时变更（含已到期者，保持 `pending`）、**不做**预占到期返还或
+    任何预占状态推进，快照余额即数据库现行余额（已反映预占预扣）；
+  - 每个入选条目在其所有命中桶各占用一份 `cost`，未命中已配置层的条目不受
+    任何桶约束（恒可行）；精确枚举 2¹⁸ 子集，按「总收益 → 项数更多 → 升序 ID
+    字典序更小」决出唯一最优；无可行项返回空入选集；
+  - `item_id` 非空且请求内唯一、`items` 1～18 项、`cost>0`、`value` 为非负
+    整数、`route_id` 必须带 `tenant_id`，否则 **422**；
+  - 规划不建桶、不写桶、不存档、不产生事件，**规划结果不保证之后准入**。
 - 配额预占（`POST /reservations`）的额外约定：
   - 创建预占与裁决共用多级桶与同一套补充/判足/扣减规则：先应用命中且到期的
     定时切换、清扫全部到期 pending 预占并返还，再统一判足；都充足才预扣并存档
@@ -1120,6 +1199,12 @@ nonce 同 key 重用 409 与过期清理后可复用、按 key 隔离、
 按 at_seconds 分侧补充、拒绝不扣减且前项影响后项、多级共享桶发散、
 只读不改策略/桶/裁决/事件、目标策略 404、命中 pending 变更 409、
 at_seconds 越界与递减等 422、未命中策略层的请求两侧准入、免认证。
+配额子集规划覆盖：多级桶精确最优（与背包贪心反例对照）、总收益相同取项数更多、
+再同取升序 ID 字典序更小（含共有前缀与输入顺序无关）、无可行项空集且不返回桶、
+0 价值项放得下即入选、未建桶按满额、只读快照同刻时间补充、不应用未到期/已到期
+定时切换且不建桶、预占预扣计入快照但规划不推进预占、全程只读不建桶不写事件、
+未配置层不限制（无任何命中桶的条目恒可行且不返回桶）、ID 输出恒升序、
+18 项枚举性能与匿名、items 数量/item_id 重复或空/cost/value/route 缺 tenant 等 422。
 配额预占覆盖：全部命中桶充足才统一预扣并保存原命中桶、任一不足全部不扣且
 rejected 存档、同 ID 同载荷重放（pending 与 rejected 两种存档）与异载荷 409、
 422/404 校验、确认仅 pending→confirmed 不重复扣减且重复确认幂等、
@@ -1136,11 +1221,11 @@ rejected 存档、同 ID 同载荷重放（pending 与 rejected 两种存档）�
 app/
   auth.py       # 管理写接口 HMAC-SHA256 防重放：签名校验（常量时间比较）、时间窗与 nonce 登记
   database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches、reservations）与老库迁移（含 baseline 版本补登）
-  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/到期惰性清扫返还）、幂等存档、撤销与低余额事件
-  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演与配额预占）
-  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview 与 /reservations 预占四接口）
+  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额子集规划（只读快照+2^18 精确枚举择优）、配额预占（统一预扣/原桶快照/确认/取消/到期惰性清扫返还）、幂等存档、撤销与低余额事件
+  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演、配额子集规划与配额预占）
+  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview、POST /quota-plans 与 /reservations 预占四接口）
 tests/
-  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演与配额预占）
+  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演、配额子集规划与配额预占）
 Dockerfile
 docker-compose.yml
 ```

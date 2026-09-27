@@ -2234,3 +2234,189 @@ def get_reservation(
     if row is None:
         raise HTTPException(404, f"reservation_id={reservation_id!r} 不存在")
     return _reservation_out(conn, row, replayed=False, now=now)
+
+
+# ------------------------------------------------------------ 配额子集规划（quota-plans）
+
+
+def _snapshot_bucket_balance(
+    conn: sqlite3.Connection,
+    policies: dict[tuple[str, str, str], tuple[float, float]],
+    now: datetime,
+) -> dict[tuple[str, str, str], float]:
+    """在只读快照内，把给定已配置策略键的桶按现行策略补充到同一时刻 now。
+
+    与写路径完全一致：桶行存在则按 (balance, updated_at) 时间补充；
+    桶尚未惰性创建（未建桶）时按现行容量视为满额。只 SELECT，不建桶、不落库，
+    不应用定时变更，也不做预占到期返还（快照余额即数据库中的现行余额）。
+    """
+    balances: dict[tuple[str, str, str], float] = {}
+    for key, (cap, rate) in policies.items():
+        row = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            key,
+        ).fetchone()
+        balances[key] = (
+            cap if row is None
+            else _refill(row["balance"], row["updated_at"], cap, rate, now)
+        )
+    return balances
+
+
+def plan_quota(
+    conn: sqlite3.Connection,
+    *,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """在只读快照上为 1～18 个待执行请求选出配额内总收益最大的子集。
+
+    调用方必须在 database.read_tx 只读快照事务内调用。语义：
+
+      - 复用裁决的三级桶匹配（全局 -> 租户 -> 路由，未配置的层不限制）；
+      - 所有涉及桶以同一时刻、同一只读快照按**现行**策略补充；未建桶按满额；
+        不推进定时策略变更（pending 保持 pending，只按当前 policies 行计算），
+        不做预占到期返还或任何预占状态推进；
+      - 每个入选条目在其**所有命中桶**各占用一份 cost（未命中任何已配置层的
+        条目不受任何桶限制）；各桶入选条目合计占用不得超过快照余额；
+      - 精确最优（2^n 全枚举 + 上界剪枝，n <= 18）：先最大化总收益 value，
+        总收益相同取条目数更多者，再相同取升序 item_id 列表字典序更小者；
+      - 全程只读：不写桶、不建桶、不存档、不产生事件；返回入选/未入选 ID、
+        总收益、命中桶在入选子集占用后的剩余额（无任何条目命中桶时为空），
+        以及快照时刻。规划只是当前快照下的演算，不保证之后真实准入。
+    """
+    now = now_utc()
+
+    # 1) 收集全部入选项命中的已配置策略键（并集，保持全局 -> 租户 -> 路由顺序）
+    all_keys: list[tuple[str, str, str]] = []
+    raw_hit_keys: list[list[tuple[str, str, str]]] = []
+    for it in items:
+        keys = _hit_keys(it.get("tenant_id"), it.get("route_id"))
+        raw_hit_keys.append(keys)
+        for k in keys:
+            if k not in all_keys:
+                all_keys.append(k)
+
+    policies: dict[tuple[str, str, str], tuple[float, float]] = {}
+    for key in all_keys:
+        pol = conn.execute(
+            "SELECT capacity, refill_rate FROM policies "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            key,
+        ).fetchone()
+        if pol is not None:
+            # 未配置的层不做限制（与裁决的命中语义一致）
+            policies[key] = (float(pol["capacity"]), float(pol["refill_rate"]))
+
+    item_hit_keys = [
+        [k for k in keys if k in policies] for keys in raw_hit_keys
+    ]
+
+    # 2) 同一时刻、同一只读快照下的桶余额；未建桶按满额
+    balances = _snapshot_bucket_balance(conn, policies, now)
+
+    # 3) 条目按 item_id 升序求解：使字典序 tie-break 与枚举结果确定
+    ordered = sorted(
+        range(len(items)),
+        key=lambda i: items[i]["item_id"],
+    )
+    candidates = [
+        {
+            "item_id": items[i]["item_id"],
+            "cost": float(items[i]["cost"]),
+            "value": int(items[i]["value"]),
+            "keys": item_hit_keys[i],
+        }
+        for i in ordered
+    ]
+    # 后缀 value 和，用于「即便全选剩余项也不可能更优」的安全剪枝
+    suffix_value = [0] * (len(candidates) + 1)
+    for i in range(len(candidates) - 1, -1, -1):
+        suffix_value[i] = suffix_value[i + 1] + candidates[i]["value"]
+
+    # 4) DFS 全枚举：可行性用扣减后的工作余额判定；快照值在回溯时恢复，
+    #    避免浮点反复加减累积误差
+    remaining = dict(balances)
+    best_value = 0
+    best_count = 0
+    best_ids: tuple[str, ...] = ()
+
+    def record(cur_value: int, chosen: list[str]) -> None:
+        nonlocal best_value, best_count, best_ids
+        ids = tuple(chosen)
+        if (
+            cur_value > best_value
+            or (
+                cur_value == best_value
+                and (
+                    len(ids) > best_count
+                    or (len(ids) == best_count and ids < best_ids)
+                )
+            )
+        ):
+            best_value, best_count, best_ids = cur_value, len(ids), ids
+
+    def dfs(idx: int, cur_value: int, chosen: list[str]) -> None:
+        # 上界剪枝：当前价值 + 剩余全部价值仍严格小于已知最优，无需继续
+        if cur_value + suffix_value[idx] < best_value:
+            return
+        if idx == len(candidates):
+            record(cur_value, chosen)
+            return
+        cand = candidates[idx]
+        # 先尝试入选（更密集地刷新最优，让剪枝尽早生效）
+        if all(remaining[k] + 1e-12 >= cand["cost"] for k in cand["keys"]):
+            snapshots = [(k, remaining[k]) for k in cand["keys"]]
+            for k in cand["keys"]:
+                remaining[k] -= cand["cost"]
+            chosen.append(cand["item_id"])
+            dfs(idx + 1, cur_value + cand["value"], chosen)
+            chosen.pop()
+            for k, bal in snapshots:
+                remaining[k] = bal
+        # 再尝试不入选
+        dfs(idx + 1, cur_value, chosen)
+
+    dfs(0, 0, [])
+
+    # 5) 命中桶（任一入选项命中的桶的并集）在入选子集占用后的剩余额
+    selected = set(best_ids)
+    hit_by_selected: list[tuple[str, str, str]] = []
+    for cand in candidates:
+        if cand["item_id"] in selected:
+            for k in cand["keys"]:
+                if k not in hit_by_selected:
+                    hit_by_selected.append(k)
+
+    buckets_out: list[dict[str, Any]] = []
+    for key in sorted(hit_by_selected):
+        cap, rate = policies[key]
+        rem = balances[key] - sum(
+            cand["cost"]
+            for cand in candidates
+            if cand["item_id"] in selected and key in cand["keys"]
+        )
+        if -1e-9 < rem < 0.0:  # 浮点减法造成的 -0.000... 归 0
+            rem = 0.0
+        buckets_out.append(
+            {
+                "scope": key[0],
+                "tenant_id": key[1] or None,
+                "route_id": key[2] or None,
+                "capacity": float(cap),
+                "refill_rate": float(rate),
+                "remaining": float(rem),
+            }
+        )
+
+    selected_ids = list(best_ids)  # 候选已按 item_id 升序枚举
+    rejected_ids = [
+        cand["item_id"] for cand in candidates if cand["item_id"] not in selected
+    ]
+    return {
+        "selected_item_ids": selected_ids,
+        "rejected_item_ids": rejected_ids,
+        "total_value": best_value,
+        "buckets": buckets_out,
+        "planned_at": iso(now),
+    }

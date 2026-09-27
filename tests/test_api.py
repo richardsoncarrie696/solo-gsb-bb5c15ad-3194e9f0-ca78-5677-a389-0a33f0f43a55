@@ -2478,3 +2478,310 @@ def test_concurrent_reservations_never_oversell(client):
 
     assert sum(results) == 10           # 恰好 10 个预占成功
     assert _global_balance(client) == 0.0
+
+
+# ============================================================ 配额子集规划（quota-plans）
+
+
+def _plan(client, items):
+    return client.post("/quota-plans", json={"items": items})
+
+
+def test_quota_plan_multilevel_picks_exact_optimum_and_remaining(client):
+    # global 容量 10；tenant t1 容量 5；均为速率 0（未建桶 -> 满额）
+    put_policy(client, "global", 10, 0)
+    put_policy(client, "tenant", 5, 0, tenant="t1")
+    r = _plan(client, [
+        {"item_id": "big", "tenant_id": "t1", "cost": 6, "value": 100},  # 超过租户容量 -> 永不可行
+        {"item_id": "a", "tenant_id": "t1", "cost": 5, "value": 10},     # 占用 g5/t5
+        {"item_id": "b", "tenant_id": "t1", "cost": 5, "value": 9},      # 与 a 互斥
+        {"item_id": "g", "cost": 5, "value": 7},                          # 仅命中全局
+    ])
+    assert r.status_code == 200
+    body = r.json()
+    # a(10)+g(7)=17 > b(9)+g(7)=16；big 永远进不来
+    assert body["selected_item_ids"] == ["a", "g"]
+    assert body["rejected_item_ids"] == ["b", "big"]
+    assert body["total_value"] == 17
+    by_scope = {b["scope"]: b["remaining"] for b in body["buckets"]}
+    # global: 10 - a5 - g5 = 0；tenant t1: 5 - a5 = 0
+    assert by_scope == {"global": 0.0, "tenant": 0.0}
+    # 桶顺序：全局 -> 租户
+    assert [b["scope"] for b in body["buckets"]] == ["global", "tenant"]
+    assert body["planned_at"].endswith("Z")
+
+
+def test_quota_plan_tie_prefers_more_items(client):
+    put_policy(client, "global", 10, 0)
+    body = _plan(client, [
+        {"item_id": "x", "cost": 10, "value": 5},
+        {"item_id": "p", "cost": 5, "value": 3},
+        {"item_id": "q", "cost": 5, "value": 2},
+    ]).json()
+    # 总价值 5 相同：单项 {x} vs 双项 {p,q} -> 选项数更多者
+    assert body["selected_item_ids"] == ["p", "q"]
+    assert body["rejected_item_ids"] == ["x"]
+    assert body["total_value"] == 5
+    assert body["buckets"][0]["remaining"] == 0.0
+
+
+def test_quota_plan_tie_lexicographic_ids(client):
+    put_policy(client, "global", 10, 0)
+    body = _plan(client, [
+        {"item_id": "b", "cost": 10, "value": 1},
+        {"item_id": "a", "cost": 10, "value": 1},
+    ]).json()
+    # 价值与项数都相同：升序 ID 列表字典序更小者
+    assert body["selected_item_ids"] == ["a"]
+    assert body["rejected_item_ids"] == ["b"]
+    assert body["total_value"] == 1
+    # 输出顺序与输入顺序无关
+    body2 = _plan(client, [
+        {"item_id": "a", "cost": 10, "value": 1},
+        {"item_id": "b", "cost": 10, "value": 1},
+    ]).json()
+    assert body2["selected_item_ids"] == ["a"]
+
+
+def test_quota_plan_tie_lexicographic_common_prefix(client):
+    put_policy(client, "global", 10, 0)
+    # 两个大小相同的集合共有前缀：[a, z] 与 [a, b]（各 cost=5，恰好装两个）
+    body = _plan(client, [
+        {"item_id": "a", "cost": 5, "value": 1},
+        {"item_id": "z", "cost": 5, "value": 1},
+        {"item_id": "b", "cost": 5, "value": 1},
+        {"item_id": "q", "cost": 5, "value": 1},
+    ]).json()
+    assert body["selected_item_ids"] == ["a", "b"]
+    assert body["total_value"] == 2
+
+
+def test_quota_plan_exact_beats_greedy(client):
+    # 按价值密度贪心会选错的经典背包：容量 10
+    put_policy(client, "global", 10, 0)
+    body = _plan(client, [
+        {"item_id": "hi", "cost": 6, "value": 7},    # 密度最高但占 6
+        {"item_id": "a", "cost": 5, "value": 6},
+        {"item_id": "b", "cost": 5, "value": 6},
+    ]).json()
+    # 贪心拿 hi(7) 后无法再拿；精确解 a+b=12
+    assert body["selected_item_ids"] == ["a", "b"]
+    assert body["total_value"] == 12
+
+
+def test_quota_plan_no_feasible_item_returns_empty(client):
+    put_policy(client, "global", 3, 0)
+    body = _plan(client, [
+        {"item_id": "x", "cost": 4, "value": 99},
+        {"item_id": "y", "cost": 3.5, "value": 1},
+    ]).json()
+    assert body["selected_item_ids"] == []
+    assert body["rejected_item_ids"] == ["x", "y"]
+    assert body["total_value"] == 0
+    # 无入选项命中桶 -> 不返回任何桶剩余额
+    assert body["buckets"] == []
+
+
+def test_quota_plan_zero_value_items_still_selected_when_fit(client):
+    put_policy(client, "global", 5, 0)
+    body = _plan(client, [
+        {"item_id": "z1", "cost": 2, "value": 0},
+        {"item_id": "z2", "cost": 2, "value": 0},
+        {"item_id": "big", "cost": 6, "value": 0},
+    ]).json()
+    # 价值相同时选项数更多：放得下的 0 价值项也入选
+    assert body["selected_item_ids"] == ["z1", "z2"]
+    assert body["rejected_item_ids"] == ["big"]
+    assert body["total_value"] == 0
+    assert body["buckets"][0]["remaining"] == 1.0
+
+
+def test_quota_plan_unbuilt_buckets_treated_as_full(client):
+    # 只配策略、不做任何裁决：桶行尚不存在，规划按现行容量满额演算
+    put_policy(client, "global", 7, 0)
+    put_policy(client, "tenant", 4, 0, tenant="t")
+    body = _plan(client, [
+        {"item_id": "a", "tenant_id": "t", "cost": 4, "value": 1},
+    ]).json()
+    assert body["selected_item_ids"] == ["a"]
+    by_scope = {b["scope"]: b["remaining"] for b in body["buckets"]}
+    assert by_scope == {"global": 3.0, "tenant": 0.0}
+    # 规划没有惰性建桶
+    assert client.get("/buckets").json() == []
+
+
+def test_quota_plan_uses_snapshot_refill_at_single_instant(client):
+    put_policy(client, "global", 10, 100)  # 高速率
+    client.post("/decide", json={"request_id": "seed", "cost": 10})  # 打空
+    import time
+    time.sleep(0.2)  # 真实桶行尚未计息；规划时在同一时刻补充快照
+    body = _plan(client, [
+        {"item_id": "a", "cost": 5, "value": 1},
+        {"item_id": "b", "cost": 5, "value": 1},
+    ]).json()
+    # 补充后的快照（10+，截到容量 10）可同时容纳两项
+    assert body["selected_item_ids"] == ["a", "b"]
+    assert body["buckets"][0]["remaining"] == pytest.approx(0.0, abs=0.02)
+    # 只读：桶行的补充没有被规划落库（balance 仍按落库值 0 展示前的计息结果）
+    listed = client.get("/buckets").json()[0]
+    assert listed["balance"] == pytest.approx(10.0, abs=0.5)  # GET 自身实时计息
+
+
+def test_quota_plan_does_not_apply_pending_change_nor_create_bucket(client):
+    # 当前容量 5 满额；登记未来扩容到 100 的切换，规划必须按现行容量 5 演算
+    put_policy(client, "global", 5, 0)
+    post_change(client, "chg", "global", 100, 0, effective_in=3600)
+    body = _plan(client, [
+        {"item_id": "big", "cost": 6, "value": 100},
+        {"item_id": "ok", "cost": 5, "value": 1},
+    ]).json()
+    assert body["selected_item_ids"] == ["ok"]
+    assert body["rejected_item_ids"] == ["big"]
+    assert body["buckets"][0]["capacity"] == 5.0
+    # 未建桶仍未建，变更仍 pending
+    assert client.get("/buckets").json() == []
+    assert client.get("/policy-changes/chg").json()["status"] == "pending"
+
+
+def test_quota_plan_ignores_due_pending_change_and_does_not_advance(client):
+    # 即便切换已到期：只读规划也不应用它（仍按 policies 表现行策略），
+    # 规划后变更保持 pending，由后续裁决惰性应用
+    put_policy(client, "global", 5, 0)
+    client.post("/decide", json={"request_id": "seed", "cost": 5})  # 余 0、已建桶
+    post_change(client, "chg", "global", 100, 0, effective_in=1)
+    import time
+    time.sleep(1.2)
+    body = _plan(client, [
+        {"item_id": "a", "cost": 1, "value": 1},
+    ]).json()
+    # 现行容量 5、速率 0、落库余额 0 -> 不可行（不应用已到期切换）
+    assert body["selected_item_ids"] == []
+    assert body["total_value"] == 0
+    assert client.get("/policy-changes/chg").json()["status"] == "pending"
+    # 桶没有被规划触碰
+    assert client.get("/buckets").json()[0]["balance"] == 0.0
+
+
+def test_quota_plan_does_not_expire_or_alter_reservations(client):
+    # 预占占用后的现行余额应被规划看到；规划本身不推进任何预占状态
+    put_policy(client, "global", 10, 0)
+    r = client.post("/reservations", json={
+        "reservation_id": "rsv-1", "cost": 4, "ttl_seconds": 60})
+    assert r.json()["status"] == "pending"
+    body = _plan(client, [{"item_id": "a", "cost": 7, "value": 1}]).json()
+    assert body["selected_item_ids"] == []  # 10 - 4 预占 = 6 < 7
+    body = _plan(client, [{"item_id": "a", "cost": 6, "value": 1}]).json()
+    assert body["selected_item_ids"] == ["a"]
+    assert body["buckets"][0]["remaining"] == 0.0
+    # 预占状态原样，规划没有产生任何扣减/返还
+    assert client.get("/reservations/rsv-1").json()["status"] == "pending"
+    assert client.get("/buckets").json()[0]["balance"] == 6.0
+
+
+def test_quota_plan_is_read_only(client):
+    put_policy(client, "global", 10, 0, threshold=8)
+    before_buckets = client.get("/buckets").json()
+    before_events = client.get("/events").json()
+    r = _plan(client, [
+        {"item_id": "a", "cost": 6, "value": 1},
+        {"item_id": "b", "cost": 6, "value": 1},
+    ])
+    assert r.status_code == 200
+    # 不建桶、不写事件
+    assert client.get("/buckets").json() == before_buckets
+    assert client.get("/events").json() == before_events == []
+    # 规划「虚拟占用」不影响真实裁决：满额 10 仍可真实扣 6
+    d = client.post("/decide", json={"request_id": "real", "cost": 6}).json()
+    assert d["allowed"] is True and d["buckets"][0]["balance"] == 4.0
+
+
+def test_quota_plan_item_hitting_no_configured_layer_is_unconstrained(client):
+    # 仅配置租户 t1 的策略；t2 的请求不命中任何已配置层：恒可行、不返回桶
+    put_policy(client, "tenant", 5, 0, tenant="t1")
+    body = _plan(client, [
+        {"item_id": "free", "tenant_id": "t2", "cost": 9999, "value": 3},
+        {"item_id": "capped", "tenant_id": "t1", "cost": 6, "value": 5},
+        {"item_id": "ok", "tenant_id": "t1", "cost": 5, "value": 4},
+    ]).json()
+    # free 无任何桶约束必入选；t1 桶内 ok(4) 优于 infeasible 的 capped
+    assert body["selected_item_ids"] == ["free", "ok"]
+    assert body["rejected_item_ids"] == ["capped"]
+    assert body["total_value"] == 7
+    # 只返回被入选条目命中的桶（free 不命中任何桶）
+    assert [(b["scope"], b["tenant_id"]) for b in body["buckets"]] == [
+        ("tenant", "t1")]
+    assert body["buckets"][0]["remaining"] == 0.0
+
+
+def test_quota_plan_no_policy_at_all_selects_everything(client):
+    body = _plan(client, [
+        {"item_id": "a", "cost": 1, "value": 1},
+        {"item_id": "b", "cost": 1, "value": 2},
+    ]).json()
+    assert body["selected_item_ids"] == ["a", "b"]
+    assert body["rejected_item_ids"] == []
+    assert body["total_value"] == 3
+    assert body["buckets"] == []
+
+
+def test_quota_plan_output_ids_are_sorted_regardless_of_input_order(client):
+    put_policy(client, "global", 100, 0)
+    body = _plan(client, [
+        {"item_id": "z", "cost": 1, "value": 1},
+        {"item_id": "a", "cost": 1, "value": 1},
+        {"item_id": "m", "cost": 1, "value": 1},
+    ]).json()
+    assert body["selected_item_ids"] == ["a", "m", "z"]
+    assert body["rejected_item_ids"] == []
+    put_policy(client, "global", 101, 0)
+    body = _plan(client, [
+        {"item_id": "z", "cost": 100, "value": 1},
+        {"item_id": "a", "cost": 100, "value": 1},
+        {"item_id": "m", "cost": 1, "value": 1},
+    ]).json()
+    # m 与 z 可共存（101），与 a 也可共存；两种最优价值/项数相同，
+    # 取升序 ID 字典序更小者：["a", "m"] < ["m", "z"]
+    assert body["selected_item_ids"] == ["a", "m"]
+    assert body["rejected_item_ids"] == ["z"]
+
+
+def test_quota_plan_18_items_completes_and_remains_anonymous(client):
+    # 无策略：18 项全部入选（枚举上界 2^18），且无需签名头
+    r = _plan(client, [
+        {"item_id": f"i{idx:02d}", "cost": 1, "value": idx}
+        for idx in range(18)
+    ])
+    assert r.status_code == 200
+    body = r.json()
+    assert len(body["selected_item_ids"]) == 18
+    assert body["total_value"] == sum(range(18))
+
+
+def test_quota_plan_validation_422(client):
+    put_policy(client, "global", 1, 0)
+    # 空列表 / 19 项 -> 422
+    assert _plan(client, []).status_code == 422
+    assert _plan(client, [
+        {"item_id": f"x{i}", "cost": 1, "value": 1} for i in range(19)
+    ]).status_code == 422
+    # item_id 重复 -> 422
+    assert _plan(client, [
+        {"item_id": "dup", "cost": 1, "value": 1},
+        {"item_id": "dup", "cost": 1, "value": 1},
+    ]).status_code == 422
+    # item_id 为空 -> 422
+    assert _plan(client, [{"item_id": "", "cost": 1, "value": 1}]).status_code == 422
+    # cost 非正 -> 422
+    assert _plan(client, [{"item_id": "a", "cost": 0, "value": 1}]).status_code == 422
+    # value 为负 / 非整数 -> 422
+    assert _plan(client, [{"item_id": "a", "cost": 1, "value": -1}]).status_code == 422
+    assert _plan(client, [{"item_id": "a", "cost": 1, "value": 1.5}]).status_code == 422
+    # route_id 缺少 tenant_id -> 422
+    assert _plan(client, [
+        {"item_id": "a", "route_id": "/r", "cost": 1, "value": 1}
+    ]).status_code == 422
+    # 恰好 18 项合法
+    ok = _plan(client, [
+        {"item_id": f"i{i}", "cost": 1, "value": 1} for i in range(18)
+    ])
+    assert ok.status_code == 200

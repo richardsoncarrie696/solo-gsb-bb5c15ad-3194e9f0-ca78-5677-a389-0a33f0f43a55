@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 
 class PolicyIn(BaseModel):
@@ -300,3 +300,62 @@ class LowBalanceEventOut(BaseModel):
     threshold: float = Field(..., description="触发本事件时的低余额阈值")
     request_id: str = Field(..., description="触发本事件的裁决 request_id")
     created_at: str
+
+
+# ------------------------------------------------------------ 配额子集规划（quota-plans）
+
+
+class QuotaPlanItemIn(BaseModel):
+    item_id: str = Field(..., min_length=1, description="本次规划内唯一的条目标识")
+    tenant_id: Optional[str] = None
+    route_id: Optional[str] = Field(default=None, description="提供 route_id 时必须带 tenant_id")
+    cost: float = Field(..., gt=0, description="正数：入选后在每个命中桶占用的令牌数")
+    value: int = Field(
+        ..., ge=0,
+        description="非负整数：该条目的收益；规划目标是总收益最大",
+    )
+
+
+class QuotaPlanIn(BaseModel):
+    items: list[QuotaPlanItemIn] = Field(
+        ..., min_length=1, max_length=18,
+        description="1～18 个待执行请求；在同一只读快照、同一时刻上求解最优子集",
+    )
+
+    @model_validator(mode="after")
+    def _validate_items(self) -> "QuotaPlanIn":
+        seen: set[str] = set()
+        for it in self.items:
+            if it.item_id in seen:
+                raise ValueError("item_id 在同一请求内必须唯一")
+            if it.route_id and not it.tenant_id:
+                raise ValueError("提供 route_id 时必须同时提供 tenant_id")
+            seen.add(it.item_id)
+        return self
+
+
+class QuotaPlanBucketOut(BaseModel):
+    scope: str
+    tenant_id: Optional[str]
+    route_id: Optional[str]
+    capacity: float = Field(..., description="快照时刻的现行策略容量（未建桶按满额）")
+    refill_rate: float
+    remaining: float = Field(
+        ..., description="入选子集占用 cost 之后该桶的剩余余额（纯演算，不落库）"
+    )
+
+
+class QuotaPlanOut(BaseModel):
+    selected_item_ids: list[str] = Field(
+        ..., description="入选条目 ID（升序）；无可行项时为空列表"
+    )
+    rejected_item_ids: list[str] = Field(
+        ..., description="未入选条目 ID（升序）"
+    )
+    total_value: int = Field(..., description="入选子集的总收益")
+    buckets: list[QuotaPlanBucketOut] = Field(
+        ...,
+        description="任一入选项命中的全部桶：快照余额补充后，入选子集各桶合计占用 cost，"
+        "按全局 -> 租户 -> 路由（键升序）给出剩余额；无入选项命中桶时为空列表",
+    )
+    planned_at: str = Field(..., description="只读快照时刻（ISO 8601 UTC）")

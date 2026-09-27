@@ -8,7 +8,8 @@
 DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
 （X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
 所有 GET、POST /decide、POST /decide-batches 裁决与撤销、
-POST /policies/impact-preview 预演与 POST /reservations 预占接口保持匿名可用。
+POST /policies/impact-preview 预演、POST /quota-plans 子集规划与
+POST /reservations 预占接口保持匿名可用。
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ from .schemas import (
     PolicyOut,
     PolicyRollbackIn,
     PolicyVersionOut,
+    QuotaPlanIn,
+    QuotaPlanOut,
     ReservationIn,
     ReservationOut,
     RevokeOut,
@@ -63,15 +66,19 @@ app = FastAPI(
         "批次按 batch_id 幂等存档。"
         "POST /policies/impact-preview 在只读快照上预演候选容量/速率对"
         "未来 0～3600 秒请求序列的影响，双侧逐条对比，不落库。"
+        "POST /quota-plans 在同一只读快照、同一时刻上为 1～18 个待执行请求"
+        "选出配额内总收益最大的子集：复用三级桶匹配，现行策略补充、未建桶按"
+        "满额，不推进定时变更或预占状态；精确枚举求解（总收益优先，再项数、"
+        "再升序 ID 字典序），返回入选/未入选 ID、总收益与命中桶剩余额，全程只读。"
         "POST /reservations 提供配额预占：全部命中桶充足才统一预扣并保存原命中桶，"
         "否则全部不扣；支持确认（仅 pending->confirmed，不再扣减）、"
         "取消（pending->cancelled，向原桶返还）与查询（到期惰性转 expired 并返还），"
         "预占 1～300 秒到期，所有余额写操作先在同一事务内完成到期返还。"
         "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
-        "GET、裁决（含批量）、预演、撤销与预占接口无需认证。"
+        "GET、裁决（含批量）、预演、子集规划、撤销与预占接口无需认证。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -212,8 +219,41 @@ def post_impact_preview(
         )
 
 
-# ------------------------------------------------------------ 策略定时切换
+# ------------------------------------------------------------ 配额子集规划
 
+
+@app.post(
+    "/quota-plans",
+    response_model=QuotaPlanOut,
+    tags=["配额子集规划"],
+    responses={
+        422: {"description": "items 数量不在 1～18、item_id 重复或为空、"
+              "cost 非正、value 为负或非整数、route_id 缺少 tenant_id 等"},
+    },
+)
+def post_quota_plan(
+    body: QuotaPlanIn, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """在只读快照上为 1～18 个待执行请求选出配额内总收益最大的子集（免认证）。
+
+    复用裁决的三级桶匹配（全局 -> 租户 -> 路由，未配置的层不限制）：所有命中桶
+    在同一只读快照、同一时刻按**现行**策略补充（未建桶按现行容量满额），不应用
+    定时策略变更（pending 保持原状，仅按 policies 表当前行计算），也不推进预占
+    到期或任何预占状态。每个入选条目在其所有命中桶各占用一份 cost，各桶合计占用
+    不得超过快照余额。服务在至多 2^18 个子集上精确枚举（含上界剪枝）求最优：
+    先最大化总收益 value；总收益相同时取条目数更多者；再相同取升序 item_id 列表
+    字典序更小者。返回入选/未入选 ID（均升序）、总收益，以及任一入选条目命中桶
+    在占用后的剩余额；无可行项时入选为空集。全程只读：不建桶、不写桶、不存档、
+    不产生事件，规划结果只反映该快照时刻，不保证这些请求之后真实准入。
+    """
+    with read_tx(conn):
+        return quota.plan_quota(
+            conn,
+            items=[item.model_dump() for item in body.items],
+        )
+
+
+# ------------------------------------------------------------ 策略定时切换
 
 @app.post(
     "/policy-changes",
