@@ -106,6 +106,16 @@
     返回 **409**；未知 ID 返回 **404**。
   - 预占的预扣**不产生** `low_balance` 事件（事件只在获准裁决的扣减事务内写入）；
     预占接口全部**免认证**。
+- **配额规划（POST /quota-plans）**：为 **1～18** 个待执行请求在**只读快照**上选出
+  配额内**总收益最大**的子集。每项含唯一 `item_id`、必填 `tenant_id`、可选
+  `route_id`（须带 `tenant_id`）、正数 `cost` 与非负整数 `value`。服务在同一
+  只读快照、**同一时刻**按**现行**策略把各命中桶补充到快照时刻（**未建桶按满额**），
+  **不推进**定时变更与预占到期状态；每个入选项在其所有命中桶（全局 → 租户 → 路由，
+  未配置的层不限制）占用 `cost`，同一桶的合计占用不得超过快照余额。在此约束下求
+  **精确最优**：总收益最大；并列时**项数更多**者优先；再并列时**升序 ID 列表字典序
+  更小**者优先。返回入选/未入选 ID、总收益与各命中桶扣除入选项后的剩余额；
+  无可行项时返回空集。规划**全程只读**（不建桶、不写裁决与事件），结果不保证
+  之后的真实裁决准入；接口免认证。
 - **并发不超发**：SQLite 处于 WAL 模式，写事务一律 `BEGIN IMMEDIATE` 立即加写锁，
   配合 `busy_timeout=30s` 让并发写者排队，读-改-写序列天然串行化。
   单进程多线程、多进程（多个实例共享同一数据库文件）下均不会超发。
@@ -113,8 +123,8 @@
   `PUT /policies`（策略新增/更新）、`POST /policies/rollback`（回滚）、
   `POST /policy-changes`（定时变更创建）、`DELETE /policy-changes/{change_id}`
   （定时变更取消）。**所有 GET、`POST /decide`、`POST /decide-batches` 裁决、
-`POST /policies/impact-preview` 预演、撤销与预占（`POST /reservations` 及其
-确认/取消/查询）接口保持原样、无需认证**。
+`POST /policies/impact-preview` 预演、撤销、预占（`POST /reservations` 及其
+确认/取消/查询）与 `POST /quota-plans` 配额规划接口保持原样、无需认证**。
   客户端发送 `X-Key-Id`、`X-Timestamp`（Unix 秒）、`X-Nonce`、`X-Signature` 四个头，
   签名原文为 `方法\n原始路径及查询串\n请求体 SHA-256 十六进制\n时间戳\nnonce`，
   签名值为小写十六进制 HMAC-SHA256。服务端用 `ADMIN_KEY_ID` / `ADMIN_HMAC_SECRET`
@@ -324,6 +334,7 @@ print(urllib.request.urlopen(req).read().decode())
 | `POST` | `/reservations/{reservation_id}/confirm` | 确认预占：仅 pending→confirmed，不再扣减；重复确认幂等，其他终态 409 |
 | `POST` | `/reservations/{reservation_id}/cancel` | 取消预占：pending→cancelled，同事务向原桶返还 cost（不超过当前容量）；重复取消幂等，已到期先转 expired 再 409 |
 | `GET`  | `/reservations/{reservation_id}` | 查询预占状态与到期时间；该预占到期时在同一事务内清理为 expired 并返还 |
+| `POST` | `/quota-plans` | 只读规划：为 1～18 个待执行请求选出配额内总收益最大的子集（精确最优，同级并列比项数、再比升序 ID 字典序）；返回入选/未入选 ID、总收益与命中桶剩余额 |
 | `GET`  | `/events` | 按 id 递增分页查询 low_balance 事件（`after_id` / `limit`） |
 
 策略对象：
@@ -998,6 +1009,52 @@ curl -s http://localhost:8000/reservations/rsv-001
 > - 返还规则与撤销一致：先应用原桶到期的定时切换、按当前策略补充，再加 `cost`，
 >   以桶**当前容量**为上限；预占的预扣与返还都**不产生** low_balance 事件。
 
+## 配额规划（POST /quota-plans，免认证、只读）
+
+配额规划回答「在不动用真实配额的前提下，当前这批待执行请求选哪些最划算」：
+提交 **1～18** 个请求项（每项：唯一 `item_id`、必填 `tenant_id`、可选
+`route_id`、正数 `cost`、非负整数 `value`），服务在**同一只读快照**上按
+**现行**策略把各命中桶补充到**同一时刻**（未建桶按满额），求出**总收益最大**
+的入选子集——每个入选项在其所有命中桶占用 `cost`，同一桶合计不超过快照余额。
+
+```bash
+# 全局容量 10、租户 acme 容量 6（refill_rate 均为 0）
+curl -s -X POST http://localhost:8000/quota-plans \
+  -H 'Content-Type: application/json' \
+  -d '{
+    "items": [
+      {"item_id": "a", "tenant_id": "acme", "cost": 4, "value": 10},
+      {"item_id": "b", "tenant_id": "acme", "cost": 4, "value": 10},
+      {"item_id": "c", "tenant_id": "acme", "cost": 2, "value": 9},
+      {"item_id": "d", "tenant_id": "acme", "route_id": "/v1/search", "cost": 5, "value": 8}
+    ]
+  }'
+```
+
+```json
+{
+  "selected_item_ids": ["a", "c"],
+  "unselected_item_ids": ["b", "d"],
+  "total_value": 19,
+  "planned_at": "2026-09-27T12:00:00.000000Z",
+  "buckets": [
+    {"scope": "global", "tenant_id": null, "route_id": null, "capacity": 10.0, "refill_rate": 0.0, "balance": 4.0},
+    {"scope": "tenant", "tenant_id": "acme", "route_id": null, "capacity": 6.0, "refill_rate": 0.0, "balance": 0.0}
+  ]
+}
+```
+
+> - 最优解是**精确**的（分支限界枚举全部子集）：先比总收益，并列比项数，
+>   再并列比**升序 ID 列表的字典序**（上例 `{a,c}` 与 `{b,c}` 收益同为 19、
+>   项数同为 2，`["a","c"]` 字典序更小）；
+> - `buckets` 给出本次规划**命中的全部桶**扣除入选项占用后的剩余额
+>   （纯演算，不落库）；未命中任何已配置策略层的项不受配额约束，恒可入选；
+> - 快照**不推进**任何状态：到期的定时切换保持 `pending`、到期的预占不返还、
+>   未建桶不创建、裁决与事件不写；规划结果只是快照时刻的演算，**不保证**之后
+>   真实裁决（`POST /decide`）的准入；
+> - 校验：项数非 1～18、`item_id` 重复或为空、缺 `tenant_id`、只给 `route_id`
+>   不给 `tenant_id`、`cost <= 0`、`value` 为负或非整数，均返回 **422**。
+
 ## 行为约定与边界
 
 - 桶首次被命中时按当前容量**满额**创建。
@@ -1065,6 +1122,16 @@ curl -s http://localhost:8000/reservations/rsv-001
   - confirmed / cancelled / expired / rejected 均为终态：同一终态操作重复调用
     幂等且不改变余额（重复取消不会二次返还、重放 expired 不会再次返还），
     其他终态转换返回 409；预占的预扣与返还均不产生 low_balance 事件。
+- 配额规划（`POST /quota-plans`）的额外约定：
+  - 全程在 `read_tx` 只读快照内演算：各命中桶按**现行**策略补充到同一快照时刻
+    （未建桶按满额），**不应用**到期定时切换、**不清扫**到期预占、不创建桶、
+    不写裁决与低余额事件；规划结果不保证之后的真实裁决准入；
+  - 每项必填 `tenant_id`，`route_id` 可选（提供时命中路由层）；未配置策略的
+    层级不限制，未命中任何层的项恒可入选（`value=0` 也会因项数并列规则入选）；
+  - 精确最优的并列规则：总收益相同比项数（多者胜），项数相同比升序 ID 列表
+    字典序（小者胜）；`selected_item_ids` / `unselected_item_ids` 均按升序返回；
+  - 响应 `buckets` 为本次规划命中的全部桶（含仅被未入选项命中的桶）扣除入选项
+    占用后的剩余额；无可行项时 `selected_item_ids` 为空、总收益为 0。
 
 ## 本地开发（不用 Docker）
 
@@ -1129,6 +1196,11 @@ rejected 存档、同 ID 同载荷重放（pending 与 rejected 两种存档）�
 到期 pending 并返还（含部分到期、返还后再扣减）、到期预占重放不重复返还、
 返还与判足沿用定时切换规则（到期换算 + 容量截断 + 缩容后不足被拒）、
 其他终态转换 409 与未知 ID 404、四接口免认证、20 线程并发预占不超发。
+配额规划覆盖：总收益最大的子集选择、多级共享桶约束、收益并列时项数优先、
+项数并列时升序 ID 字典序优先、快照余额与未建桶按满额、路由层匹配、
+未命中策略层的项恒可入选、无可行项返回空集、只读（不改桶/裁决/事件、
+不建桶）、不推进到期定时切换与到期预占、快照时刻统一补充、
+1～18 项与 item_id 唯一性等 422 校验、免认证，以及与暴力枚举对照的精确最优性。
 
 ## 项目结构
 
@@ -1136,11 +1208,11 @@ rejected 存档、同 ID 同载荷重放（pending 与 rejected 两种存档）�
 app/
   auth.py       # 管理写接口 HMAC-SHA256 防重放：签名校验（常量时间比较）、时间窗与 nonce 登记
   database.py   # SQLite 连接、WAL/busy_timeout、BEGIN IMMEDIATE 写事务 / 只读快照事务、建表（含 admin_nonces、decide_batches、reservations）与老库迁移（含 baseline 版本补登）
-  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/到期惰性清扫返还）、幂等存档、撤销与低余额事件
-  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演与配额预占）
-  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview 与 /reservations 预占四接口）
+  quota.py      # 策略 upsert、版本审计/回滚、定时切换登记/取消/到期应用、惰性补充、整组裁决、批量裁决（同刻切换+按序共享桶+全获准才落库+批次幂等存档）、策略影响预演（只读快照+现行/候选双侧内存演算）、配额预占（统一预扣/原桶快照/确认/取消/到期惰性清扫返还）、配额规划（只读快照+分支限界精确最优子集）、幂等存档、撤销与低余额事件
+  schemas.py    # Pydantic 请求/响应模型（含批量裁决、影响预演、配额预占与配额规划）
+  main.py       # FastAPI 路由（4 个管理写接口挂载签名依赖，其余匿名，含 POST /decide-batches、POST /policies/impact-preview、/reservations 预占四接口与 POST /quota-plans）
 tests/
-  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演与配额预占）
+  test_api.py   # 行为、并发与 HMAC 认证测试（含批量裁决、策略影响预演、配额预占与配额规划）
 Dockerfile
 docker-compose.yml
 ```

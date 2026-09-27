@@ -290,6 +290,33 @@ class ReservationOut(BaseModel):
     )
 
 
+class QuotaPlanItemIn(BaseModel):
+    item_id: str = Field(..., min_length=1, description="待执行请求的标识，本次规划内唯一")
+    tenant_id: str = Field(..., min_length=1, description="必填；命中租户层策略")
+    route_id: Optional[str] = Field(
+        default=None, description="可选；提供时同时命中路由层策略（必须带 tenant_id）"
+    )
+    cost: float = Field(..., gt=0, description="入选后在所有命中桶占用的令牌数（正数）")
+    value: int = Field(..., ge=0, description="入选收益（非负整数）")
+
+
+class QuotaPlanIn(BaseModel):
+    items: list[QuotaPlanItemIn] = Field(
+        ..., min_length=1, max_length=18,
+        description="1～18 个待执行请求；在只读快照上选出配额内总收益最大的子集",
+    )
+
+
+class QuotaPlanOut(BaseModel):
+    selected_item_ids: list[str] = Field(..., description="入选项 ID（升序）")
+    unselected_item_ids: list[str] = Field(..., description="未入选项 ID（升序）")
+    total_value: int = Field(..., description="入选项的总收益")
+    planned_at: str = Field(..., description="规划快照时刻（ISO 8601 UTC）")
+    buckets: list[BucketOut] = Field(
+        ..., description="本次规划命中的桶扣除入选项占用后的剩余额（只读演算，不落库）"
+    )
+
+
 class LowBalanceEventOut(BaseModel):
     id: int = Field(..., description="单调递增的事件 id，用作分页游标")
     scope: str

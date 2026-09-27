@@ -1699,6 +1699,166 @@ def impact_preview(
     }
 
 
+# ------------------------------------------------------------ 配额规划（只读）
+
+
+def plan_quota(
+    conn: sqlite3.Connection,
+    *,
+    items: list[dict[str, Any]],
+) -> dict[str, Any]:
+    """在只读快照上为 1～18 个待执行请求选出配额内总收益最大的子集。
+
+    调用方必须在 database.read_tx 只读快照事务内调用；全程不改动任何落库
+    状态：不应用到期的定时切换、不推进预占到期状态、不创建/更新桶、不写
+    裁决与事件。规划结果只是快照时刻的演算，不保证之后的真实裁决准入。
+
+    流程：
+      1. 以同一时刻 now 为快照时刻，把各命中桶按现行策略补充到 now
+         （未建桶按满额参与）；
+      2. 每个入选项在其所有命中桶（全局 -> 租户 -> 路由，未配置的层不限制）
+         占用 cost，同一桶被选中项的合计 cost 不得超过快照余额；
+      3. 在该约束下求精确最优子集（分支限界枚举）：总收益最大；并列时项数
+         更多者优先；再并列时升序 ID 列表字典序更小者优先；
+      4. 返回入选/未入选 ID、总收益与各命中桶扣除入选项占用后的剩余额。
+    """
+    seen: set[str] = set()
+    for it in items:
+        item_id = it["item_id"]
+        if item_id in seen:
+            raise HTTPException(422, f"item_id={item_id!r} 在请求中重复")
+        seen.add(item_id)
+        if it["cost"] <= 0:
+            raise HTTPException(422, "cost 必须为正数")
+        if it.get("route_id") and not it.get("tenant_id"):
+            raise HTTPException(422, "提供 route_id 时必须同时提供 tenant_id")
+
+    now = now_utc()
+
+    # 每项按 全局 -> 租户 -> 路由 命中的策略键；未配置的层不参与约束
+    item_hit_keys: list[list[tuple[str, str, str]]] = []
+    involved: list[tuple[str, str, str]] = []
+    for it in items:
+        keys = _hit_keys(it.get("tenant_id"), it.get("route_id"))
+        item_hit_keys.append(keys)
+        for key in keys:
+            if key not in involved:
+                involved.append(key)
+
+    # 同一只读快照：现行策略与桶余额一次读入，统一补充到 now（未建桶按满额）
+    policies: dict[tuple[str, str, str], tuple[float, float]] = {}
+    balances: dict[tuple[str, str, str], float] = {}
+    for key in involved:
+        pol = conn.execute(
+            "SELECT capacity, refill_rate FROM policies "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            key,
+        ).fetchone()
+        if pol is None:
+            continue  # 未配置的层不限制
+        cap, rate = float(pol["capacity"]), float(pol["refill_rate"])
+        b = conn.execute(
+            "SELECT balance, updated_at FROM buckets "
+            "WHERE scope=? AND tenant_id=? AND route_id=?",
+            key,
+        ).fetchone()
+        balances[key] = (
+            cap
+            if b is None
+            else _refill(b["balance"], b["updated_at"], cap, rate, now)
+        )
+        policies[key] = (cap, rate)
+
+    # 命中桶的确定性顺序：全局 -> 租户 -> 路由，同层按键排序
+    scope_rank = {"global": 0, "tenant": 1, "route": 2}
+    bucket_keys = sorted(balances, key=lambda k: (scope_rank[k[0]], k[1], k[2]))
+    bucket_index = {key: i for i, key in enumerate(bucket_keys)}
+    snapshot = [balances[key] for key in bucket_keys]
+
+    # 每项占用的桶下标（空列表 = 不命中任何已配置层，恒可入选）
+    item_buckets: list[list[int]] = [
+        [bucket_index[key] for key in keys if key in bucket_index]
+        for keys in item_hit_keys
+    ]
+
+    n = len(items)
+    # 分支限界的搜索顺序：收益降序（并列按 item_id 升序，保证结果确定性）
+    order = sorted(range(n), key=lambda i: (-items[i]["value"], items[i]["item_id"]))
+    suffix_value = [0] * (n + 1)
+    for pos in range(n - 1, -1, -1):
+        suffix_value[pos] = suffix_value[pos + 1] + items[order[pos]]["value"]
+
+    best_value = 0
+    best_count = 0
+    best_ids: tuple[str, ...] = ()
+    caps = list(snapshot)
+    current_ids: list[str] = []
+
+    def dfs(pos: int, current_value: int) -> None:
+        nonlocal best_value, best_count, best_ids
+        # 上界剪枝：剩余项全选也无法更优（收益严格更小，或收益持平且项数
+        # 严格更少）时停止展开；收益与项数都可能持平时继续搜索字典序
+        if current_value + suffix_value[pos] < best_value:
+            return
+        if (
+            current_value + suffix_value[pos] == best_value
+            and len(current_ids) + (n - pos) < best_count
+        ):
+            return
+        if pos == n:
+            ids = tuple(sorted(current_ids))
+            count = len(ids)
+            if (
+                current_value > best_value
+                or (current_value == best_value and count > best_count)
+                or (
+                    current_value == best_value
+                    and count == best_count
+                    and ids < best_ids
+                )
+            ):
+                best_value, best_count, best_ids = current_value, count, ids
+            return
+        i = order[pos]
+        cost = float(items[i]["cost"])
+        demand = item_buckets[i]
+        if all(caps[b] + 1e-12 >= cost for b in demand):
+            for b in demand:
+                caps[b] -= cost
+            current_ids.append(items[i]["item_id"])
+            dfs(pos + 1, current_value + items[i]["value"])
+            current_ids.pop()
+            for b in demand:
+                caps[b] += cost
+        dfs(pos + 1, current_value)
+
+    dfs(0, 0)
+
+    # 各命中桶扣除入选项占用后的剩余额（纯内存演算，不落库）
+    remaining = list(snapshot)
+    selected = set(best_ids)
+    for i, it in enumerate(items):
+        if it["item_id"] in selected:
+            for b in item_buckets[i]:
+                remaining[b] -= float(it["cost"])
+
+    return {
+        "selected_item_ids": sorted(selected),
+        "unselected_item_ids": sorted(
+            it["item_id"] for it in items if it["item_id"] not in selected
+        ),
+        "total_value": best_value,
+        "planned_at": iso(now),
+        "buckets": [
+            _bucket_out(
+                key[0], key[1], key[2],
+                policies[key][0], policies[key][1], remaining[idx],
+            )
+            for idx, key in enumerate(bucket_keys)
+        ],
+    }
+
+
 # ---------------------------------------------------------------- 撤销
 
 

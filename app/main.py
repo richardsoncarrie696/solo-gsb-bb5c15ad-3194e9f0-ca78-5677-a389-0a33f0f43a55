@@ -8,7 +8,8 @@
 DELETE /policy-changes/{change_id}）需要 HMAC-SHA256 防重放签名
 （X-Key-Id/X-Timestamp/X-Nonce/X-Signature，见 app/auth.py）；
 所有 GET、POST /decide、POST /decide-batches 裁决与撤销、
-POST /policies/impact-preview 预演与 POST /reservations 预占接口保持匿名可用。
+POST /policies/impact-preview 预演、POST /reservations 预占
+与 POST /quota-plans 配额规划接口保持匿名可用。
 """
 
 from __future__ import annotations
@@ -37,6 +38,8 @@ from .schemas import (
     PolicyOut,
     PolicyRollbackIn,
     PolicyVersionOut,
+    QuotaPlanIn,
+    QuotaPlanOut,
     ReservationIn,
     ReservationOut,
     RevokeOut,
@@ -67,11 +70,14 @@ app = FastAPI(
         "否则全部不扣；支持确认（仅 pending->confirmed，不再扣减）、"
         "取消（pending->cancelled，向原桶返还）与查询（到期惰性转 expired 并返还），"
         "预占 1～300 秒到期，所有余额写操作先在同一事务内完成到期返还。"
+        "POST /quota-plans 在只读快照上为 1～18 个待执行请求规划配额内总收益最大的"
+        "子集：同一时刻按现行策略补充各命中桶（未建桶按满额），不推进定时变更与"
+        "预占状态，精确求最优（总收益最大、项数更多、升序 ID 字典序更小），全程只读。"
         "管理写接口（策略新增/更新、回滚、定时变更创建/取消）需要"
         " HMAC-SHA256 防重放签名（X-Key-Id/X-Timestamp/X-Nonce/X-Signature）；"
-        "GET、裁决（含批量）、预演、撤销与预占接口无需认证。"
+        "GET、裁决（含批量）、预演、撤销、预占与配额规划接口无需认证。"
     ),
-    version="1.7.0",
+    version="1.8.0",
     lifespan=lifespan,
 )
 
@@ -499,3 +505,33 @@ def get_reservation(
     """
     with write_tx(conn):
         return quota.get_reservation(conn, reservation_id)
+
+
+# ---------------------------------------------------------------- 配额规划
+
+
+@app.post(
+    "/quota-plans",
+    response_model=QuotaPlanOut,
+    tags=["配额规划"],
+    responses={
+        422: {"description": "项数非 1～18、item_id 重复/为空、cost 非正、value 为负或非整数、route_id 缺少 tenant_id 等"},
+    },
+)
+def post_quota_plan(
+    body: QuotaPlanIn, conn: sqlite3.Connection = Depends(get_conn)
+) -> dict:
+    """为 1～18 个待执行请求规划配额内总收益最大的子集（免认证、全程只读）。
+
+    在同一只读快照、同一时刻下：按现行策略把各命中桶补充到快照时刻
+    （未建桶按满额），不应用到期的定时切换、不推进预占到期状态；每个入选项
+    在其所有命中桶（全局 -> 租户 -> 路由，未配置的层不限制）占用 cost，
+    同一桶的合计占用不得超过快照余额。在此约束下求精确最优子集：总收益最大；
+    并列时项数更多者优先；再并列时升序 ID 列表字典序更小者优先。
+    返回入选/未入选 ID、总收益与各命中桶扣除入选项后的剩余额；无可行项时
+    返回空集。规划结果不改动任何落库状态，也不保证之后的真实裁决准入。
+    """
+    with read_tx(conn):
+        return quota.plan_quota(
+            conn, items=[item.model_dump() for item in body.items]
+        )
